@@ -1,0 +1,67 @@
+name: Safe upstream sync (two modes)
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: safe-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update both versions
+        shell: bash
+        env:
+          UPSTREAM_REPO: liuzq2002/adguard-home-manager-mod
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Fetch the upstream snapshot once; if upstream disappears, no fork branch changes.
+          SOURCE_DIR="$(mktemp -d)"
+          trap 'rm -rf "$SOURCE_DIR"' EXIT
+          git clone --quiet --depth 1 --branch main "https://github.com/$UPSTREAM_REPO.git" "$SOURCE_DIR/upstream"
+
+          for BRANCH in main upstream-mirror; do
+            git fetch --quiet origin "$BRANCH:refs/remotes/origin/$BRANCH"
+            git switch -C "$BRANCH" "refs/remotes/origin/$BRANCH"
+
+            if [ "$BRANCH" = "main" ]; then
+              # Keep files removed upstream, but update added/modified files.
+              rsync -a --exclude='/.git/' --exclude='/.github/' "$SOURCE_DIR/upstream/" ./
+            else
+              # Mirror upstream file removals as well; keep local GitHub workflow configuration.
+              rsync -a --delete --exclude='/.git/' --exclude='/.github/' "$SOURCE_DIR/upstream/" ./
+            fi
+
+            git add -A
+
+            # Never remove a tracked file on the protected main branch.
+            if [ "$BRANCH" = "main" ] && [ -n "$(git diff --cached --name-only --diff-filter=D)" ]; then
+              echo "Deletion detected on main. Aborting without pushing."
+              exit 1
+            fi
+
+            if git diff --cached --quiet; then
+              echo "$BRANCH is already up to date."
+              continue
+            fi
+
+            git commit -m "Sync $UPSTREAM_REPO into $BRANCH"
+            git push origin "HEAD:refs/heads/$BRANCH"
+          done
